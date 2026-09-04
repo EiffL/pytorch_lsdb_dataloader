@@ -87,8 +87,9 @@ with Join([ddp_model]):
 
 ## Development
 
-The per-pixel `to_delayed(pixels=...)` API is not in lsdb 0.10.4 yet; until it is released, install lsdb from
-a checkout that includes it (for example `pip install -e ../lsdb`), or point `PYTHONPATH` at its `src`.
+The per-pixel `to_delayed(pixels=...)` API is not in lsdb 0.10.4 yet, so `pyproject.toml` pins lsdb to the
+branch of the fork that adds it; `pip install -e .` fetches that branch. Once it is released, the pin becomes a
+plain version bound.
 
 ```
 pip install -e .[dev]
