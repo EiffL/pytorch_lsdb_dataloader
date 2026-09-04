@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lsdb-torch"
+version = "0.1.0"
+description = "Stream LSDB (HATS) catalogs into PyTorch DataLoaders, single-node or distributed."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    # Needs Catalog.to_delayed(pixels=...) and compute(scheduler=...), unreleased as of lsdb 0.10.4.
+    "lsdb>0.10.4",
+    "torch>=2.0",
+    "numpy",
+    "pyarrow",
+    "dask",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lsdb_torch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::FutureWarning", "ignore::RuntimeWarning"]
