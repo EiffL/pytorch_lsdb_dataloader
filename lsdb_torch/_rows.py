@@ -14,13 +14,16 @@ Getter = Callable[[int], Any]
 
 
 def _nested_getter(series: pd.Series) -> Getter:
-    """Zero-copy access to the lists of a nested column, one dict of arrays per row."""
+    """Access nested rows as array views, preserving null lists as None."""
     lists = series.array.list_array.combine_chunks()
     offsets = np.asarray(lists.offsets)
+    nulls = lists.is_null().to_numpy(zero_copy_only=False) if lists.null_count else None
     structs = lists.values
     flat = {name: structs.field(name).to_numpy(zero_copy_only=False) for name in structs.type.names}
 
-    def get(i: int) -> dict[str, np.ndarray]:
+    def get(i: int) -> dict[str, np.ndarray] | None:
+        if nulls is not None and nulls[i]:
+            return None
         start, stop = offsets[i], offsets[i + 1]
         return {name: values[start:stop] for name, values in flat.items()}
 
@@ -55,13 +58,30 @@ def column_getter(series: pd.Series) -> Getter:
     return _object_getter(series)
 
 
+def copy_row(row: Any) -> Any:
+    """Copy NumPy arrays through dicts, lists and tuples; retain other values."""
+    if isinstance(row, np.ndarray):
+        copied = row.copy()
+        if row.dtype == object:
+            for index in np.ndindex(row.shape):
+                copied[index] = copy_row(row[index])
+        return copied
+    if isinstance(row, dict):
+        return {key: copy_row(value) for key, value in row.items()}
+    if isinstance(row, list):
+        return [copy_row(value) for value in row]
+    if isinstance(row, tuple):
+        return tuple(copy_row(value) for value in row)
+    return row
+
+
 class ColumnarPartition:
     """A computed partition, decomposed into per-column accessors.
 
     Rows are plain dicts: numpy scalars for numeric columns, a dict of numpy
-    array views for nested columns, python objects (str, bytes, dict) for
-    everything else. The frame's index (the HATS spatial index) is included
-    under its own name.
+    array views for nested columns (None for null rows), python objects (str,
+    bytes, dict) for everything else. Empty nested rows contain empty arrays.
+    The frame's index (the HATS spatial index) is included under its own name.
     """
 
     def __init__(self, df: pd.DataFrame):

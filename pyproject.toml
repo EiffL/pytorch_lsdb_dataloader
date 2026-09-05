@@ -10,10 +10,9 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    # Needs Catalog.to_delayed(pixels=...) and compute(scheduler=...), unreleased as of lsdb 0.10.4:
-    # https://github.com/astronomy-commons/lsdb (draft PR from the branch below). Switch back to a
-    # plain version bound once it is released.
-    "lsdb @ git+https://github.com/EiffL/lsdb.git@per-pixel-delayed-and-local-scheduler",
+    # Efficient Catalog.to_delayed(pixels=...) and local schedulers (LSDB PR #1609).
+    # Use an immutable revision until this is available in a release.
+    "lsdb @ git+https://github.com/EiffL/lsdb.git@a478de002ad7ee073c826ded92f501462bd739a3",
     "torch>=2.0",
     "numpy",
     "pyarrow",
@@ -21,7 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+checkpoint = ["torchdata>=0.11"]
+examples = ["pillow"]
+dev = ["pytest", "torchdata>=0.11", "pillow"]
 
 [tool.hatch.metadata]
 # Required for the git dependency on the lsdb fork above.
@@ -33,3 +34,7 @@ packages = ["lsdb_torch"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::FutureWarning", "ignore::RuntimeWarning"]
+
+[tool.black]
+line-length = 119
+target-version = ["py311"]

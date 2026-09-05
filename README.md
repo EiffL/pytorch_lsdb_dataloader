@@ -1,99 +1,240 @@
 # lsdb-torch
 
-Stream an [LSDB](https://github.com/astronomy-commons/lsdb) catalog into a PyTorch `DataLoader`,
-on one machine or across a multi-node distributed training job.
+Stream an [LSDB](https://github.com/astronomy-commons/lsdb) catalog through PyTorch `IterableDataset`
+and `DataLoader`, locally or across data-parallel ranks. Lazy filters, crossmatches, and
+partition preprocessing stay in LSDB; workers compute partitions and decode training samples.
+
+## Install
+
+```bash
+pip install -e .
+pip install -e '.[examples]'    # MMU example: Pillow
+pip install -e '.[checkpoint]' # Optional TorchData StatefulDataLoader
+```
+
+LSDB is pinned to immutable commit `a478de002ad7ee073c826ded92f501462bd739a3`
+providing efficient `to_delayed(pixels=...)` and local scheduler support. See [pyproject.toml](pyproject.toml).
+Replace that pin with a version requirement when the necessary API is released.
+
+## Basic use
 
 ```python
 import lsdb
 from torch.utils.data import DataLoader
 from lsdb_torch import LSDBDataset
 
-gz10 = lsdb.open_catalog("hf://datasets/UniverseTBD/mmu_gz10")
-sdss = lsdb.open_catalog("hf://datasets/UniverseTBD/mmu_sdss_sdss")
-xmatch = gz10.crossmatch(sdss, n_neighbors=1)
-
-ds = LSDBDataset(xmatch, transform=decode)      # decode(row: dict) -> sample, a module-level function
-loader = DataLoader(ds, batch_size=32, num_workers=10)
-for batch in loader:
-    ...
+if __name__ == "__main__":
+    catalog = lsdb.open_catalog("/data/catalog", columns=["ra", "dec"])
+    ds = LSDBDataset(catalog, seed=42)
+    loader = DataLoader(
+        ds, batch_size=32, num_workers=4,
+        persistent_workers=True, multiprocessing_context="spawn",
+        pin_memory=True, prefetch_factor=1,
+    )
+    for epoch in range(3):
+        ds.set_epoch(epoch)
+        for batch in loader:
+            # Numeric columns are CPU tensors, e.g. batch["ra"].
+            ...
 ```
 
-Any lazy catalog works: opened, region-filtered, column-selected (`catalog[["ra", "spectrum.flux"]]`),
-crossmatched, or transformed with `catalog.map_partitions(...)`. Do partition-level preprocessing in lsdb;
-do per-sample work (image decoding, tensor conversion) in `transform`, which runs inside the workers.
+This finite-epoch example is suitable for one training rank. See the distributed
+section before using a finite loader in a synchronized training loop.
 
-## How it works
+Pass `transform=decode` to apply a picklable callable to each row inside the worker.
+Use a module-level function or a picklable callable object. Custom `collate_fn`
+functions also run in workers and should be defined at module level. The main guard
+above is required for spawn-based multiprocessing.
 
-An lsdb catalog is a lazy graph of HEALPix-partitioned operations. `LSDBDataset` gives each DataLoader worker
-process, on each rank, a disjoint shard of the partitions. The worker asks lsdb for the task graph of one
-partition at a time, culled to that single pixel (for a crossmatch: three parquet reads and the match), and
-runs it in process with Dask's synchronous scheduler while the next partition is prefetched on a background
-thread. Only public lsdb API is used: `catalog.to_delayed(pixels=[pixel])` and `compute(scheduler="synchronous")`.
+Project columns at open, e.g. `lsdb.open_catalog(path, columns=["ra", "dec", "spectrum.flux"])`,
+and apply partition preprocessing with `catalog.map_partitions(...)`; the adapter executes that lazy graph.
 
-There is no Dask cluster anywhere. The DataLoader workers are the executors, so scaling data loading is
-`num_workers`, and the only thing shipped to a worker is the pickled catalog (kilobytes to a few megabytes).
-Opening remote catalogs reads metadata once, in the main process.
+Rows are dictionaries containing numeric NumPy values, nested dictionaries of arrays,
+and Python objects such as strings, bytes, or image structs. A missing nested record
+is `None`; a valid empty record contains empty arrays. Arrays may be read-only views or copies;
+copy arrays before mutating them. There is no end-to-end zero-copy guarantee.
+`_healpix_29` is a spatial index and can repeat; use a source identifier when uniqueness matters.
 
-Rows are yielded as dicts: numpy scalars for numeric columns, `{field: np.ndarray}` for nested columns
-(zero-copy views into the partition), and python objects (`str`, `bytes`, struct dicts) otherwise. The HATS
-spatial index `_healpix_29` is included as the sample id.
+The default collator handles fixed-size numeric arrays. Variable lengths and nulls need
+a custom collator. Return tensors or containers of tensors for automatic memory pinning;
+a list of NumPy arrays from a custom collator is not automatically pinned. See
+[PyTorch's data loading documentation](https://docs.pytorch.org/docs/stable/data.html).
 
-## Shuffling and epochs
+## Execution and partition ownership
 
-- `shuffle=True` permutes the partition order every epoch and the row order within each partition.
-- Each batch is collated inside one worker from consecutive rows, so without further mixing a batch comes
-  from a single HEALPix pixel. Set `shuffle_buffer_size` (in rows, e.g. 1000 for tiny partitions, 10k for
-  large ones) to mix rows across partitions at the cost of that much memory per worker. The buffer must fill
-  before the first row is yielded, so on slow remote catalogs it delays the first batch accordingly.
-- Call `ds.set_epoch(epoch)` before each epoch, exactly like `DistributedSampler`. With
-  `persistent_workers=True` (recommended, worker startup imports lsdb and torch) this is not needed: the
-  long-lived workers advance the epoch themselves.
+The adapter enumerates pixels with `catalog.get_healpix_pixels()`, requests each owned
+partition with `catalog.to_delayed(pixels=[pixel])`, and computes it with the synchronous
+Dask scheduler. These are public APIs. No Dask cluster is required by the loader.
+Training processes and their worker replicas hold catalog metadata and the lazy graph.
 
-## Distributed training
+Partitions are assigned to data-parallel ranks first, then to each rank's local workers.
+Ranks may use different worker counts without changing their rank-level ownership.
+Changing worker count can still change batching, row order, and worker-local repetition.
 
-Rank and world size are detected from `torch.distributed` if initialized, else from the `RANK` and
-`WORLD_SIZE` environment variables set by `torchrun`, else default to a single process. Pass `rank=` and
-`world_size=` to override. Every rank must construct the same catalog with the same `seed` and use the same
-`num_workers`. When the rank comes from the process group, construction gathers every rank's partition list and
-fails if they differ.
-
-Finite epochs are ragged: partitions have different row counts, and for crossmatches the counts are not even
-known in advance, so ranks yield different numbers of batches. Two supported recipes:
+By default, assignment balances the number of partitions. Optional `partition_weights`
+greedily balances estimated cost at both levels:
 
 ```python
-# 1. step-based training: never run out of data
-ds = LSDBDataset(xmatch, loop=True)
-for step, batch in zip(range(steps_per_epoch), loader): ...
-
-# 2. finite epochs: let DDP handle ranks that finish early
-from torch.distributed.algorithms.join import Join
-with Join([ddp_model]):
-    for batch in loader: ...
+pixels = catalog.get_healpix_pixels()
+# costs_by_pixel comes from a manifest or measurements for this catalog snapshot.
+weights = [costs_by_pixel[pixel] for pixel in pixels]
+ds = LSDBDataset(catalog, partition_weights=weights, seed=42)
 ```
 
-## Practical notes
+Supply one finite, nonnegative weight per pixel, in exactly that order, on every rank.
+Known row counts, bytes, or measured processing costs are reasonable inputs. Counts
+from source catalogs do not describe filtered or crossmatched output automatically.
+The adapter never computes row counts to infer weights. Neither assignment method
+guarantees equal rows, batches, or processing time.
 
-- `transform` must be picklable (a module-level function): Python 3.14 starts workers with `forkserver`.
-- Nested columns with variable-length lists (light curves) need a custom `collate_fn`; fixed-length ones
-  (spectra) stack with the default collate.
-- Nested arrays are read-only views; convert them in `transform` if you mutate in place.
-- Use `DataLoader(timeout=...)` against remote catalogs so a stalled HTTP read cannot hang a distributed job.
-- Memory per worker is about two partitions plus `prefetch_factor` collated batches.
-- A crossmatch partition reads the whole right-hand partition (plus its margin) to match the left rows, every
-  epoch. If that is expensive or bandwidth-bound (for example matching a few thousand galaxies against a
-  catalog of spectra over HTTP), materialize it once with `xmatch.write_catalog(path)`, on a Dask cluster if you
-  like, and train from the written catalog. The written catalog also carries row counts, so its partitions are
-  known in advance.
+## Epochs and distributed training
+
+Call `ds.set_epoch(epoch)` on every rank **before creating the next loader iterator**,
+including with persistent workers. The epoch is shared with those workers. It never
+advances automatically: repeated iterations use epoch zero until changed, and setting
+the same epoch repeats the adapter's ordering. An existing iterator retains its epoch.
+Random transforms have their own state and reproducibility requirements.
+
+Rank/size detection uses an initialized default `torch.distributed` process group,
+otherwise `RANK`/`WORLD_SIZE`, otherwise `0`/`1`. Override with both `rank=` and
+`world_size=`. Construction performs no collective communication and does not verify
+catalog agreement across ranks. The trainer must supply the same immutable catalog,
+pixel order, seed, epoch, and weights everywhere.
+
+In hybrid parallel training, pass **data-parallel** coordinates explicitly. Global GPU
+rank is not the right coordinate for tensor/pipeline/context parallel peers that must
+consume coordinated samples. Coordinate their loading in the training application.
+
+Finite shards generally produce different batch counts. `drop_last=True` drops each
+worker's partial batch; it does not equalize ranks. There is no dataset `__len__`.
+For synchronous distributed training, use an explicitly balanced finite schedule or
+a repeating loader with the same number of training steps on every data-parallel rank:
+
+```python
+ds = LSDBDataset(catalog, loop=True, seed=42, rank=dp_rank, world_size=dp_size)
+loader = DataLoader(ds, batch_size=32, num_workers=4, persistent_workers=True,
+                    multiprocessing_context="spawn", pin_memory=True, prefetch_factor=1)
+ds.set_epoch(0)
+batches = iter(loader)  # Retain this iterator across trainer epoch boundaries.
+for training_epoch in range(num_training_epochs):
+    for step in range(steps_per_epoch):  # Same schedule on every data-parallel rank.
+        batch = next(batches)
+        # Training application: transfer tensors, forward/backward, optimizer step.
+        ...
+```
+
+With `loop=True`, each worker repeats its fixed partition assignment, reshuffling each
+local pass when enabled. These cycles are independent; they are not global catalog
+epochs. Smaller shards can repeat their rows more often. Every worker must have at
+least one row in its assignment: an empty shard raises an error instead of spinning.
+Use fewer ranks/workers or a more finely partitioned catalog when necessary.
+
+Choose repetition and loss weighting deliberately. Equal step counts do not imply an
+exactly-once catalog pass, equal sample contributions, or equal token contributions.
+Variable batch/token counts also require the trainer's intended loss normalization.
+[DDP Join](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel.join)
+alone does not reconcile ordinary optimizer/scheduler state after uneven
+training, and additional collectives need their own handling; it is not a general
+replacement for a consistent distributed step schedule.
+
+## MMU images and spectra
+
+[examples/mmu_crossmatch.py](examples/mmu_crossmatch.py) projects the GZ10 image,
+redshift, and label columns and the SDSS flux/wavelength columns before crossmatching.
+For repeated training, materialize the crossmatch once:
+
+```bash
+python examples/mmu_crossmatch.py --materialize /data/mmu_crossmatch
+python examples/mmu_crossmatch.py --catalog /data/mmu_crossmatch
+python examples/mmu_crossmatch.py  # Optional live remote crossmatch preview
+```
+
+Materialization writes a new HATS catalog without overwriting an existing one. A live
+crossmatch recomputes matching and reads its source partitions and margins on every
+pass; source work may exceed the size of the matched output substantially.
+
+The example yields uint8 NCHW image tensors when image sizes agree, otherwise a list
+of CHW tensors. Spectra are float32 padded tensors with lengths and a boolean padding
+mask; that mask does not describe survey measurement quality. Labels, redshifts, and
+spatial indices are tensors too. It checks malformed spectra, preserves missing
+redshifts as NaN, and leaves image resizing, normalization, and GPU transfer to training.
+
+## Shuffling, concurrency, and memory
+
+| Dataset option | Default | Behavior |
+| --- | --- | --- |
+| `shuffle` | `True` | Permute partitions and rows using seed/epoch/local cycle. |
+| `shuffle_buffer_size` | `0` | Mix rows across partitions in a worker-local random-eviction buffer. |
+| `prefetch` | `True` | Compute one next partition on a background thread per iterator. |
+| `worker_cpu_threads` | `1` | Arrow CPU pool size in each DataLoader worker; `None` preserves it. |
+| `worker_io_threads` | `1` | Arrow I/O pool size in each DataLoader worker; `None` preserves it. |
+
+Batches consume consecutive rows within a worker, so large pixels can dominate a
+batch without buffering. The shuffle buffer fills before emitting samples. Its arrays
+are copied to avoid retaining entire source partitions. Its capacity is measured in
+**rows, not bytes**; large samples still require substantial memory.
+
+Budget worker metadata, source frames and conversion intermediates, current/next
+partitions, owned shuffle-buffer rows, decoded samples, and collated batches together.
+DataLoader also prefetches `prefetch_factor` batches per worker; pinning introduces
+additional host buffers. `prefetch=False` removes the extra computed partition, not
+these other allocations. Single-process loading leaves Arrow thread settings unchanged.
+
+Tune workers and memory per node. Four workers per GPU on 8-GPU nodes means 32 workers
+per node, or 512 workers across 16 nodes. More workers cannot remove storage bandwidth
+limits. Pinning and `non_blocking=True` transfers can help; actual overlap with GPU
+compute requires appropriate stream handling in the trainer. See the
+[PyTorch transfer guide](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html).
+
+`DataLoader(timeout=...)` limits waiting for a worker batch. Configure storage backend
+request timeouts/retries separately. Iterator cleanup releases queued work and owned
+buffers, but an already-running storage read cannot be forcibly cancelled.
+
+## Checkpointing
+
+Install `.[checkpoint]` and replace `DataLoader` with TorchData's `StatefulDataLoader`.
+The adapter's worker-local iterators implement state hooks; TorchData accounts for
+worker prefetch when capturing progress corresponding to consumed batches:
+
+```python
+from torchdata.stateful_dataloader import StatefulDataLoader
+
+loader = StatefulDataLoader(ds, batch_size=32, num_workers=4,
+                           persistent_workers=True, multiprocessing_context="spawn",
+                           in_order=True, snapshot_every_n_steps=100)
+batches = iter(loader)
+batch = next(batches)
+# Complete the corresponding training step before saving the training checkpoint.
+data_state = loader.state_dict()  # Save this rank's state in the training checkpoint.
+
+# After recreating ds and loader with the same configuration:
+loader.load_state_dict(data_state)
+batches = iter(loader)  # Resume; do not reset the epoch or recreate this each step.
+```
+
+Save/load loader state **per data-parallel rank**, along with the trainer's model,
+optimizer, scheduler, and random state at a consistent step. TorchData aggregates
+workers, not ranks. Keep rank/worker counts, batch size, `in_order=True`, transforms,
+collation, and dataset configuration unchanged across restoration.
+
+The catalog contents and lazy output row order must be immutable and reproducible.
+Checkpoint validation checks pixels, weights, ordering options, and topology; its
+fingerprint is not a content hash and cannot detect changed source rows or transforms.
+Checkpoints store shuffle-buffer row references: restore rereads each distinct buffered pixel,
+then the current partition as needed, which may read that pixel again.
+
+A stochastic transform must own its RNG and expose both `state_dict()` and
+`load_state_dict()`. Arbitrary global RNG state and random collation are not captured
+by the adapter. `snapshot_every_n_steps` controls worker-state transfer overhead and
+possible replay during restoration; it does not schedule durable training checkpoints.
+See [TorchData's StatefulDataLoader documentation](https://meta-pytorch.org/data/beta/torchdata.stateful_dataloader.html).
 
 ## Development
 
-The per-pixel `to_delayed(pixels=...)` API is not in lsdb 0.10.4 yet, so `pyproject.toml` pins lsdb to the
-branch of the fork that adds it; `pip install -e .` fetches that branch. Once it is released, the pin becomes a
-plain version bound.
-
-```
-pip install -e .[dev]
+```bash
+pip install -e '.[dev]'
 python -m pytest -q
-python examples/mmu_crossmatch.py                # user story, over the network
-torchrun --nproc_per_node=2 examples/ddp_smoke.py  # sharding check with a gloo process group
+torchrun --standalone --nproc_per_node=2 examples/ddp_smoke.py
 ```
+
+Tests use synthetic/local catalogs; the MMU commands explicitly access remote data.

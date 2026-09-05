@@ -19,10 +19,13 @@ def compute_pixel(catalog: HealpixDataset, pixel: HealpixPixel) -> npd.NestedFra
     return partition.compute(scheduler="synchronous")
 
 
-def limit_worker_threads(cpu_count: int = 2) -> None:
-    """Cap pyarrow's thread pool inside a DataLoader worker process.
+def limit_worker_threads(cpu_count: int | None = 1, io_count: int | None = 1) -> None:
+    """Cap pyarrow's separate CPU and I/O pools inside a DataLoader worker.
 
     Every worker would otherwise create an all-core pool; N workers times all
     cores thrashes the node while decoding parquet.
     """
-    pa.set_cpu_count(cpu_count)
+    if cpu_count is not None:
+        pa.set_cpu_count(cpu_count)
+    if io_count is not None:
+        pa.set_io_thread_count(io_count)
